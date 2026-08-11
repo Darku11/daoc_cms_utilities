@@ -1,13 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using DOL.GS;
-using DOL.GS.Geometry;
 using DOL.GS.PacketHandler;
 using DOL.Database;
 using DOL.Events;
@@ -25,7 +26,253 @@ namespace DOL.GS.Scripts
     /// actions (including item purchases from the CMS itemshop). Do not run an
     /// older itemshop.cs / WebShopService / WebShopPoller / WebShopDispatcher
     /// alongside it — two systems answering the same purpose will conflict.
+    ///
+    /// Runs unmodified on both DOL and OpenDAoC. The two forks are identical
+    /// for almost everything this script touches (GameClient, GamePlayer,
+    /// GameEventMgr, eChatType, ...); they only diverge on a handful of APIs
+    /// (online-client lookups, the logging framework, ItemTemplate's class
+    /// name, ScriptMgr.GuessCommand's signature). Those diverging calls can't
+    /// be written directly in source — the compiler binds them against
+    /// whichever GameServer.dll is referenced, and the two forks' method sets
+    /// don't overlap there — so ServerCoreCompat below resolves them via
+    /// reflection at load time instead. Everything else stays plain, direct
+    /// code.
     /// </summary>
+    internal static class ServerCoreCompat
+    {
+        private static Type FindType(string fullName)
+        {
+            foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type type;
+                try { type = asm.GetType(fullName, false); }
+                catch { continue; }
+
+                if (type != null)
+                    return type;
+            }
+            return null;
+        }
+
+        // ── logging ──────────────────────────────────────────────
+        // OpenDAoC dropped log4net for DOL.Logging.Logger; both expose the
+        // same Debug/Info/Warn/Error(string) method names and IsXEnabled
+        // properties, so a dynamic handle bound to whichever one is actually
+        // loaded works unchanged on either fork.
+        public static dynamic CreateLogger(Type owner)
+        {
+            Type loggerManager = FindType("DOL.Logging.LoggerManager");
+            if (loggerManager != null)
+            {
+                MethodInfo create = loggerManager.GetMethod("Create", new[] { typeof(Type) });
+                if (create != null)
+                    return create.Invoke(null, new object[] { owner });
+            }
+
+            Type log4netManager = FindType("log4net.LogManager");
+            if (log4netManager != null)
+            {
+                MethodInfo getLogger = log4netManager.GetMethod("GetLogger", new[] { typeof(Type) });
+                if (getLogger != null)
+                    return getLogger.Invoke(null, new object[] { owner });
+            }
+
+            return new NullLogger();
+        }
+
+        private sealed class NullLogger
+        {
+            public bool IsDebugEnabled => false;
+            public bool IsInfoEnabled => false;
+            public bool IsWarnEnabled => false;
+            public bool IsErrorEnabled => false;
+            public void Debug(string _) { }
+            public void Info(string _) { }
+            public void Warn(string _) { }
+            public void Error(string _) { }
+        }
+
+        // ── online clients ──────────────────────────────────────
+        // DOL:      WorldMgr.GetAllClients() / WorldMgr.GetClientByPlayerName(name, exact, active)
+        // OpenDAoC: ClientService.Instance.GetClients() / ClientService.Instance.GetPlayerByExactName(name)
+        public static List<GameClient> AllClients()
+        {
+            Type clientService = FindType("DOL.GS.ClientService");
+            if (clientService != null)
+            {
+                object instance = clientService.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                MethodInfo getClients = clientService.GetMethod("GetClients", Type.EmptyTypes);
+                if (instance != null && getClients != null)
+                {
+                    object result = getClients.Invoke(instance, null);
+                    if (result is IEnumerable<GameClient> clients)
+                        return clients.ToList();
+                }
+            }
+
+            Type worldMgr = FindType("DOL.GS.WorldMgr");
+            MethodInfo getAllClients = worldMgr?.GetMethod("GetAllClients", BindingFlags.Public | BindingFlags.Static);
+            if (getAllClients != null)
+            {
+                object result = getAllClients.Invoke(null, null);
+                if (result is IEnumerable<GameClient> clients)
+                    return clients.ToList();
+            }
+
+            return new List<GameClient>();
+        }
+
+        public static GameClient FindClientByName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return null;
+
+            Type clientService = FindType("DOL.GS.ClientService");
+            if (clientService != null)
+            {
+                object instance = clientService.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                MethodInfo getPlayer = clientService.GetMethod("GetPlayerByExactName", new[] { typeof(string) });
+                if (instance != null && getPlayer != null)
+                {
+                    dynamic player = getPlayer.Invoke(instance, new object[] { name });
+                    if (player == null)
+                        return null;
+                    return player.Client;
+                }
+            }
+
+            Type worldMgr = FindType("DOL.GS.WorldMgr");
+            MethodInfo getClientByName = worldMgr?.GetMethod("GetClientByPlayerName", new[] { typeof(string), typeof(bool), typeof(bool) });
+            if (getClientByName != null)
+                return (GameClient)getClientByName.Invoke(null, new object[] { name, true, false });
+
+            // Neither known API resolved — fall back to a manual scan.
+            return AllClients().FirstOrDefault(c => c.Player != null && c.Player.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        // ── item templates ──────────────────────────────────────
+        // DOL: DOL.Database.ItemTemplate — OpenDAoC: DOL.Database.DbItemTemplate.
+        // Both expose the same shape (Name, GetName, ...), so the caller
+        // treats the result as `dynamic` once resolved.
+        public static dynamic FindItemTemplateByKey(string itemId)
+        {
+            Type templateType = FindType("DOL.Database.DbItemTemplate") ?? FindType("DOL.Database.ItemTemplate");
+            if (templateType == null)
+                return null;
+
+            object database = GameServer.Database;
+            MethodInfo findGeneric = database.GetType().GetMethods()
+                .FirstOrDefault(m => m.Name == "FindObjectByKey" && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+            if (findGeneric == null)
+                return null;
+
+            return findGeneric.MakeGenericMethod(templateType).Invoke(database, new object[] { itemId });
+        }
+
+        // ── commands ─────────────────────────────────────────────
+        // DOL: ScriptMgr.GuessCommand(string) — OpenDAoC: ScriptMgr.GuessCommand(string, ePrivLevel).
+        public static ScriptMgr.GameCommand GuessCommand(string commandName, ePrivLevel maxPrivLevel)
+        {
+            MethodInfo withPrivLevel = typeof(ScriptMgr).GetMethod("GuessCommand", new[] { typeof(string), typeof(ePrivLevel) });
+            if (withPrivLevel != null)
+                return (ScriptMgr.GameCommand)withPrivLevel.Invoke(null, new object[] { commandName, maxPrivLevel });
+
+            MethodInfo simple = typeof(ScriptMgr).GetMethod("GuessCommand", new[] { typeof(string) });
+            return simple != null ? (ScriptMgr.GameCommand)simple.Invoke(null, new object[] { commandName }) : null;
+        }
+
+        // ── encumbrance refresh ──────────────────────────────────
+        // DOL: GamePlayer.UpdateEncumberance() — OpenDAoC fixed the typo:
+        // GamePlayer.UpdateEncumbrance(bool forced = false).
+        public static void UpdateEncumbrance(GamePlayer player)
+        {
+            MethodInfo method = typeof(GamePlayer).GetMethod("UpdateEncumbrance", new[] { typeof(bool) })
+                ?? typeof(GamePlayer).GetMethod("UpdateEncumberance", new[] { typeof(bool) })
+                ?? typeof(GamePlayer).GetMethod("UpdateEncumbrance", Type.EmptyTypes)
+                ?? typeof(GamePlayer).GetMethod("UpdateEncumberance", Type.EmptyTypes);
+
+            if (method == null)
+                return;
+
+            object[] args = method.GetParameters().Length == 0 ? null : new object[] { true };
+            method.Invoke(player, args);
+        }
+
+        // OpenDAoC exposes ForceGainExperience(long), while DOL exposes
+        // GainExperience(eXPSource, long). Resolve the OpenDAoC method first;
+        // the enum fallback then covers current and older DOL-style cores.
+        public static void GrantExperience(GamePlayer player, long amount)
+        {
+            MethodInfo forceMethod = typeof(GamePlayer).GetMethod(
+                "ForceGainExperience",
+                BindingFlags.Public | BindingFlags.Instance,
+                null,
+                new[] { typeof(long) },
+                null);
+            if (forceMethod != null)
+            {
+                forceMethod.Invoke(player, new object[] { amount });
+                return;
+            }
+
+            MethodInfo method = typeof(GamePlayer).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .Where(m => m.Name == "GainExperience")
+                .FirstOrDefault(m =>
+                {
+                    ParameterInfo[] parameters = m.GetParameters();
+                    return parameters.Length == 2
+                        && parameters[0].ParameterType.IsEnum
+                        && parameters[1].ParameterType == typeof(long);
+                });
+
+            if (method == null)
+            {
+                method = typeof(GamePlayer).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .Where(m => m.Name == "GainExperience")
+                    .FirstOrDefault(m =>
+                    {
+                        ParameterInfo[] parameters = m.GetParameters();
+                        return parameters.Length == 3
+                            && parameters[0].ParameterType.IsEnum
+                            && parameters[1].ParameterType == typeof(long)
+                            && parameters[2].ParameterType == typeof(bool);
+                    });
+            }
+
+            if (method == null)
+                throw new MissingMethodException("No compatible GamePlayer.GainExperience overload found.");
+
+            ParameterInfo[] argsInfo = method.GetParameters();
+            object source = Enum.Parse(argsInfo[0].ParameterType, "Other");
+            object[] args = argsInfo.Length == 2
+                ? new object[] { source, amount }
+                : new object[] { source, amount, false };
+            method.Invoke(player, args);
+        }
+
+        // DOL declares eReleaseType inside GamePlayer, while OpenDAoC exposes
+        // it at namespace level. Invoke Release through its actual enum type so
+        // an admin revive preserves the original explicit "Normal" behavior.
+        public static void ReleaseNormally(GamePlayer player)
+        {
+            MethodInfo method = typeof(GamePlayer).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .Where(m => m.Name == "Release")
+                .FirstOrDefault(m =>
+                {
+                    ParameterInfo[] parameters = m.GetParameters();
+                    return parameters.Length == 2
+                        && parameters[0].ParameterType.IsEnum
+                        && parameters[1].ParameterType == typeof(bool);
+                });
+
+            if (method == null)
+                throw new MissingMethodException("No compatible GamePlayer.Release overload found.");
+
+            object normal = Enum.Parse(method.GetParameters()[0].ParameterType, "Normal");
+            method.Invoke(player, new object[] { normal, true });
+        }
+    }
+
     public class AldhranBridge
     {
         private static TcpListener _listener;
@@ -47,7 +294,7 @@ namespace DOL.GS.Scripts
         // of guessing a hardcoded base.
         private static readonly Dictionary<string, short> _frozenSpeed = new Dictionary<string, short>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly log4net.ILog log = log4net.LogManager.GetLogger(System.Reflection.MethodBase.GetCurrentMethod().DeclaringType);
+        private static readonly dynamic log = ServerCoreCompat.CreateLogger(typeof(AldhranBridge));
 
         [ScriptLoadedEvent]
         public static void OnScriptCompiled(DOLEvent e, object sender, EventArgs args)
@@ -205,7 +452,7 @@ namespace DOL.GS.Scripts
         {
             var players = new List<object>();
 
-            foreach (GameClient gameClient in WorldMgr.GetAllClients())
+            foreach (GameClient gameClient in ServerCoreCompat.AllClients())
             {
                 if (gameClient.Player != null)
                 {
@@ -239,7 +486,7 @@ namespace DOL.GS.Scripts
         // ── kick ──────────────────────────────────────────────────
         private static string Handle_Kick(string name, string reason)
         {
-            GameClient client = WorldMgr.GetClientByPlayerName(name, true, false);
+            GameClient client = ServerCoreCompat.FindClientByName(name);
             if (client == null || client.Player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
@@ -247,7 +494,9 @@ namespace DOL.GS.Scripts
             {
                 client.Out.SendMessage(reason ?? "You have been kicked from the server.", eChatType.CT_Important, eChatLoc.CL_SystemWindow);
                 client.Player.SaveIntoDatabase();
-                GameServer.Instance.Disconnect(client);
+                // OpenDAoC moved disconnect handling from GameServer to the
+                // client; GameClient.Disconnect() is public on both cores.
+                client.Disconnect();
                 return JsonConvert.SerializeObject(new { ok = true });
             }
             catch (Exception ex)
@@ -259,7 +508,7 @@ namespace DOL.GS.Scripts
         // ── privlevel ─────────────────────────────────────────────
         private static string Handle_PrivLevel(string name, int level)
         {
-            GameClient client = WorldMgr.GetClientByPlayerName(name, true, false);
+            GameClient client = ServerCoreCompat.FindClientByName(name);
             if (client == null || client.Player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
@@ -279,15 +528,13 @@ namespace DOL.GS.Scripts
         // ── teleport ──────────────────────────────────────────────
         private static string Handle_Teleport(string name, int x, int y, int z, int region)
         {
-            GameClient client = WorldMgr.GetClientByPlayerName(name, true, false);
+            GameClient client = ServerCoreCompat.FindClientByName(name);
             if (client == null || client.Player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
             try
             {
-                var teleportPosition = Position.Create(
-                    (ushort)region, x, y, z, client.Player.Orientation.InHeading);
-                client.Player.MoveTo(teleportPosition);
+                client.Player.MoveTo((ushort)region, x, y, z, client.Player.Heading);
                 return JsonConvert.SerializeObject(new { ok = true });
             }
             catch (Exception ex)
@@ -299,22 +546,15 @@ namespace DOL.GS.Scripts
         // ── giveitem ──────────────────────────────────────────────
         private static string Handle_GiveItem(string buyerName, string itemId, int count)
         {
-            GamePlayer player = null;
-            foreach (GameClient gameClient in WorldMgr.GetAllClients())
-            {
-                if (gameClient.Player != null && gameClient.Player.Name.Equals(buyerName, StringComparison.OrdinalIgnoreCase))
-                {
-                    player = gameClient.Player;
-                    break;
-                }
-            }
+            GameClient client = ServerCoreCompat.FindClientByName(buyerName);
+            GamePlayer player = client?.Player;
 
             if (player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
             try
             {
-                ItemTemplate template = GameServer.Database.FindObjectByKey<ItemTemplate>(itemId);
+                dynamic template = ServerCoreCompat.FindItemTemplateByKey(itemId);
                 if (template == null)
                     return JsonConvert.SerializeObject(new { ok = false, error = "Item not found." });
 
@@ -323,8 +563,10 @@ namespace DOL.GS.Scripts
 
                 if (player.Inventory.AddItem(eInventorySlot.FirstEmptyBackpack, item))
                 {
-                    player.Out.SendInventoryItemsUpdate(new InventoryItem[] { item });
-                    player.UpdateEncumberance();
+                    // AddItem already pushes the changed slot to the client itself
+                    // (both forks flush it as part of the same call), so no explicit
+                    // SendInventoryItemsUpdate is needed here.
+                    ServerCoreCompat.UpdateEncumbrance(player);
                     player.SaveIntoDatabase();
                     player.Out.SendMessage($"You have received {template.Name} x{count}!", eChatType.CT_Important, eChatLoc.CL_SystemWindow);
                     return JsonConvert.SerializeObject(new { ok = true });
@@ -342,7 +584,7 @@ namespace DOL.GS.Scripts
         // ── setstats ──────────────────────────────────────────────
         private static string Handle_SetStats(string name, string stat, int value)
         {
-            GameClient client = WorldMgr.GetClientByPlayerName(name, true, false);
+            GameClient client = ServerCoreCompat.FindClientByName(name);
             if (client == null || client.Player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
@@ -377,9 +619,9 @@ namespace DOL.GS.Scripts
                         break;
 
                     case "xp":
-                        // GainExperience(long, ...) — an absolute "gain" relative to 0, since
-                        // there is no direct setter for the total XP standing.
-                        player.GainExperience(GameLiving.eXPSource.Other, value, 0, 0, 0, false, false, false);
+                        // XP is a gain amount; both cores intentionally expose no
+                        // direct setter for the character's total XP standing.
+                        ServerCoreCompat.GrantExperience(player, value);
                         break;
 
                     case "gold":
@@ -437,7 +679,7 @@ namespace DOL.GS.Scripts
         {
             try
             {
-                foreach (GameClient gameClient in WorldMgr.GetAllClients())
+                foreach (GameClient gameClient in ServerCoreCompat.AllClients())
                 {
                     if (gameClient.Player != null)
                         gameClient.Out.SendMessage($"[{sender}] {message}", eChatType.CT_Broadcast, eChatLoc.CL_SystemWindow);
@@ -461,7 +703,7 @@ namespace DOL.GS.Scripts
                 int count = 0;
                 string formattedMessage = $"[Discord] {sender}: {message}";
 
-                foreach (GameClient gameClient in WorldMgr.GetAllClients())
+                foreach (GameClient gameClient in ServerCoreCompat.AllClients())
                 {
                     if (gameClient.Player != null && gameClient.Player.Guild != null)
                     {
@@ -544,7 +786,7 @@ namespace DOL.GS.Scripts
                 return JsonConvert.SerializeObject(new { ok = false, error = "No command given." });
 
             string trimmed = commandLine.Trim();
-            if (trimmed.StartsWith("/"))
+            if (trimmed.StartsWith("/") || trimmed.StartsWith("&"))
                 trimmed = trimmed.Substring(1);
 
             string[] pars = trimmed.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
@@ -564,11 +806,11 @@ namespace DOL.GS.Scripts
                 GameClient executorClient = null;
 
                 if (!string.IsNullOrWhiteSpace(executorName))
-                    executorClient = WorldMgr.GetClientByPlayerName(executorName, true, false);
+                    executorClient = ServerCoreCompat.FindClientByName(executorName);
 
                 if (executorClient == null)
                 {
-                    foreach (GameClient gc in WorldMgr.GetAllClients())
+                    foreach (GameClient gc in ServerCoreCompat.AllClients())
                     {
                         if (gc.Player != null && gc.Account != null && gc.Account.PrivLevel >= 2)
                         {
@@ -581,11 +823,12 @@ namespace DOL.GS.Scripts
                 if (executorClient == null || executorClient.Player == null)
                     return JsonConvert.SerializeObject(new { ok = false, error = "No suitable executor (online GM/admin) found." });
 
-                var cmdEntry = ScriptMgr.GuessCommand("/" + cmdName);
+                string serverCommand = "&" + cmdName;
+                var cmdEntry = ServerCoreCompat.GuessCommand(serverCommand, (ePrivLevel)executorClient.Account.PrivLevel);
                 if (cmdEntry == null)
                     return JsonConvert.SerializeObject(new { ok = false, error = $"Unknown command: {cmdName}" });
 
-                pars[0] = "/" + cmdName;
+                pars[0] = cmdEntry.m_cmd;
 
                 cmdEntry.m_cmdHandler.OnCommand(executorClient, pars);
 
@@ -602,7 +845,7 @@ namespace DOL.GS.Scripts
         // ── heal ──────────────────────────────────────────────────
         private static string Handle_Heal(string name)
         {
-            GameClient client = WorldMgr.GetClientByPlayerName(name, true, false);
+            GameClient client = ServerCoreCompat.FindClientByName(name);
             if (client == null || client.Player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
@@ -626,14 +869,14 @@ namespace DOL.GS.Scripts
         // ── revive ────────────────────────────────────────────────
         private static string Handle_Revive(string name)
         {
-            GameClient client = WorldMgr.GetClientByPlayerName(name, true, false);
+            GameClient client = ServerCoreCompat.FindClientByName(name);
             if (client == null || client.Player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
             try
             {
                 GamePlayer player = client.Player;
-                player.Release(GamePlayer.eReleaseType.Normal, true);
+                ServerCoreCompat.ReleaseNormally(player);
                 return JsonConvert.SerializeObject(new { ok = true });
             }
             catch (Exception ex)
@@ -650,7 +893,7 @@ namespace DOL.GS.Scripts
         // that isn't persisted, if needed.
         private static string Handle_Freeze(string name, bool on)
         {
-            GameClient client = WorldMgr.GetClientByPlayerName(name, true, false);
+            GameClient client = ServerCoreCompat.FindClientByName(name);
             if (client == null || client.Player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
@@ -689,13 +932,15 @@ namespace DOL.GS.Scripts
         // ── mute / unmute ─────────────────────────────────────────
         private static string Handle_Mute(string name, bool on)
         {
-            GameClient client = WorldMgr.GetClientByPlayerName(name, true, false);
+            GameClient client = ServerCoreCompat.FindClientByName(name);
             if (client == null || client.Player == null)
                 return JsonConvert.SerializeObject(new { ok = false, error = "Player offline." });
 
             try
             {
                 client.Player.IsMuted = on;
+                client.Account.IsMuted = on;
+                GameServer.Database.SaveObject(client.Account);
                 client.Player.Out.SendMessage(
                     on ? "You have been muted by an admin." : "You have been unmuted.",
                     eChatType.CT_Important, eChatLoc.CL_SystemWindow);
