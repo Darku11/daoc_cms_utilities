@@ -38,7 +38,8 @@ internal sealed class BridgeClient
             await writer.WriteLineAsync(JsonSerializer.Serialize(payload));
             await writer.FlushAsync(timeout.Token);
 
-            string response = (await reader.ReadToEndAsync(timeout.Token)).Trim();
+            string? responseLine = await reader.ReadLineAsync(timeout.Token);
+            string response = responseLine?.Trim() ?? "";
             if (response.Length == 0)
                 return Error("The game server bridge returned no response.");
 
@@ -70,5 +71,11 @@ internal sealed class BridgeClient
     }
 
     private static JsonElement Error(string message)
-        => JsonSerializer.SerializeToElement(new { ok = false, error = message });
+        => JsonSerializer.SerializeToElement(new
+        {
+            ok = false,
+            server_online = false,
+            players = Array.Empty<object>(),
+            error = message
+        });
 }

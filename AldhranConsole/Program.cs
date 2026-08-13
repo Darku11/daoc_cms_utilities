@@ -6,8 +6,7 @@ using System.Text.Json;
 
 // ============================================================
 //  Aldhran Ingame Console — ASP.NET Minimal API
-//  Version: 2.5.0 — unified configuration, hardened authentication,
-//                    shared CMS client and DOL/OpenDAoC documentation
+//  Version: 2.6.0 — core-neutral player presence and itemshop protocol fixes
 //  PHP communicates exclusively with this Console (HTTP:5100).
 //  Console forwards to AldhranBridge (TCP:2000).
 // ============================================================
@@ -49,6 +48,18 @@ static bool BridgeSucceeded(JsonElement response)
     => response.ValueKind == JsonValueKind.Object
         && response.TryGetProperty("ok", out JsonElement ok)
         && ok.ValueKind == JsonValueKind.True;
+
+static bool BridgeDoesNotKnowAction(JsonElement response, string action)
+{
+    if (response.ValueKind != JsonValueKind.Object
+        || !response.TryGetProperty("error", out JsonElement error)
+        || error.ValueKind != JsonValueKind.String)
+        return false;
+
+    string message = error.GetString() ?? "";
+    return message.Contains("Unknown action", StringComparison.OrdinalIgnoreCase)
+        && message.Contains(action, StringComparison.OrdinalIgnoreCase);
+}
 
 static async Task<bool> SetMoneyAsync(
     BridgeClient bridgeClient,
@@ -103,6 +114,72 @@ app.MapGet("/health", () => Results.Ok(new
 app.MapGet("/status", async () =>
 {
     return Results.Ok(await bridge.SendAsync(new { action = "status" }));
+});
+
+// ── POST /players/online ──────────────────────────────
+// Checks only the requested characters. The itemshop does not need the full
+// admin-status payload and therefore remains independent of class/region
+// serialization differences between DOL and OpenDAoC.
+app.MapPost("/players/online", async ([FromBody] JsonElement body) =>
+{
+    if (!body.TryGetProperty("names", out JsonElement namesElement)
+        || namesElement.ValueKind != JsonValueKind.Array)
+        return Results.BadRequest(new { ok = false, error = "names array required" });
+
+    var names = namesElement
+        .EnumerateArray()
+        .Where(value => value.ValueKind == JsonValueKind.String)
+        .Select(value => value.GetString()?.Trim())
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .Cast<string>()
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+    if (names.Length > 100)
+        return Results.BadRequest(new { ok = false, error = "at most 100 names are allowed" });
+
+    JsonElement presence = await bridge.SendAsync(new { action = "players_online", names });
+    if (BridgeSucceeded(presence) || !BridgeDoesNotKnowAction(presence, "players_online"))
+        return Results.Ok(presence);
+
+    // Upgrade compatibility: an already running server may still have the
+    // previous bridge assembly loaded. Its status response contains the same
+    // player names, so the itemshop can continue to work until the next clean
+    // script compilation/restart activates the dedicated presence action.
+    JsonElement status = await bridge.SendAsync(new { action = "status" });
+    if (!BridgeSucceeded(status))
+        return Results.Ok(status);
+
+    var requested = names.ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var online = new List<string>();
+    if (status.TryGetProperty("players", out JsonElement players)
+        && players.ValueKind == JsonValueKind.Array)
+    {
+        foreach (JsonElement player in players.EnumerateArray())
+        {
+            if (player.ValueKind != JsonValueKind.Object
+                || !player.TryGetProperty("Name", out JsonElement nameElement)
+                || nameElement.ValueKind != JsonValueKind.String)
+                continue;
+
+            string? playerName = nameElement.GetString();
+            if (!string.IsNullOrWhiteSpace(playerName) && requested.Contains(playerName))
+                online.Add(playerName);
+        }
+    }
+
+    string core = status.TryGetProperty("core", out JsonElement coreElement)
+        && coreElement.ValueKind == JsonValueKind.String
+            ? coreElement.GetString() ?? "unknown"
+            : "unknown";
+
+    return Results.Ok(new
+    {
+        ok = true,
+        server_online = true,
+        core,
+        online
+    });
 });
 
 // ── POST /kick ────────────────────────────────────────────────
@@ -370,14 +447,19 @@ app.MapGet("/shop/cm-listings", async (HttpRequest request) =>
 app.MapPost("/shop/purchase", async ([FromBody] JsonElement body) =>
 {
     var buyer   = body.TryGetProperty("buyer_name", out var bn) ? bn.GetString() : null;
-    var source  = body.TryGetProperty("source",     out var sr) ? sr.GetString() : null;
+    var source  = body.TryGetProperty("source",     out var sr) ? sr.GetString()?.Trim().ToLowerInvariant() : null;
     var itemRef = body.TryGetProperty("item_ref",    out var ir) ? ir.GetString() : null;
     var count   = body.TryGetProperty("count",      out var ct) ? ct.GetInt32()  : 1;
 
     if (string.IsNullOrWhiteSpace(buyer) || string.IsNullOrWhiteSpace(source) || string.IsNullOrWhiteSpace(itemRef))
         return Results.BadRequest(new { ok = false, error = "buyer_name, source, item_ref required" });
 
-    if (source != "player" && source != "system")
+    // Older CMS builds used "player" for housing listings. Accept it as an
+    // upgrade alias, but use "housing" as the canonical protocol value.
+    if (source == "player")
+        source = "housing";
+
+    if (source != "housing" && source != "system")
         return Results.BadRequest(new { ok = false, error = "invalid source" });
 
     if (count < 1 || count > 100)
@@ -441,7 +523,7 @@ app.MapPost("/shop/purchase", async ([FromBody] JsonElement body) =>
         if (totalCopper < finalPrice) return Results.Ok(new { ok = false, error = "The character does not have enough gold for this purchase." });
 
         // 3. Reserve a player listing atomically before changing live character state.
-        if (source == "player")
+        if (source == "housing")
         {
             int reserved = await database.ExecuteAsync(
                 "UPDATE inventory SET Count = Count - @count " +
