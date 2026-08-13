@@ -68,9 +68,9 @@ static async Task<string> SendBridgeCommand(string host, int port, string bridge
 
         var sb  = new StringBuilder();
         var buf = new char[4096];
+        using var readCts = new System.Threading.CancellationTokenSource(5000);
         int read;
-        client.ReceiveTimeout = 5000;
-        while ((read = await reader.ReadAsync(buf, 0, buf.Length)) > 0)
+        while ((read = await reader.ReadAsync(buf.AsMemory(0, buf.Length), readCts.Token)) > 0)
             sb.Append(buf, 0, read);
 
         var response = sb.ToString().Trim();
