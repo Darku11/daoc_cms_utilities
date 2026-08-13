@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 /*
  * DAoC CMS - Guild Chat -> Discord Bridge
  *
@@ -117,8 +118,8 @@ namespace DOL.GS.Commands
         // Your site's api_events.php endpoint.
         private const string API_URL = "https://YOUR-SITE.example/api_events.php";
 
-        // Must match "Bridge Secret" under ACP -> General Settings -> Bridge Connection
-        // (game_server_bridge_secret).
+        // Must match "Shared Secret" under ACP -> General Settings -> Bridge Connection
+        // (game_server_shared_secret).
         private const string BRIDGE_SECRET = "CHANGE_ME_BRIDGE_SECRET";
 
         // DOL accepts a params object[] while current OpenDAoC exposes a

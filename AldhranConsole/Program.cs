@@ -1,17 +1,13 @@
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Http;
+/* SPDX-License-Identifier: GPL-3.0-only */
+using AldhranConsole;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using MySqlConnector;
-using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 
 // ============================================================
 //  Aldhran Ingame Console — ASP.NET Minimal API
-//  Version: 2.4.0 — Teleport/Zone-Lookup fix, Raw-Command fix,
-//                    Item-Autocomplete, Heal/Revive/Freeze endpoints
+//  Version: 2.5.0 — unified configuration, hardened authentication,
+//                    shared CMS client and DOL/OpenDAoC documentation
 //  PHP communicates exclusively with this Console (HTTP:5100).
 //  Console forwards to AldhranBridge (TCP:2000).
 // ============================================================
@@ -19,147 +15,94 @@ using System.Text.Json;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddLogging();
 
+ConsoleOptions options = ConsoleOptions.Load(builder.Configuration);
+options.Validate();
+builder.Services.AddSingleton(options);
+builder.Services.AddSingleton<BridgeClient>();
+builder.Services.AddSingleton<GameDatabase>();
+
 var app = builder.Build();
+var bridge = app.Services.GetRequiredService<BridgeClient>();
+var database = app.Services.GetRequiredService<GameDatabase>();
+var logger = app.Services.GetRequiredService<ILogger<Program>>();
+string serviceVersion = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "unknown";
 
-// ── Config ────────────────────────────────────────────────────
-var API_SECRET      = builder.Configuration["Console:ApiSecret"]    ?? "CHANGE_ME_IN_APPSETTINGS";
-var DB_CONN         = builder.Configuration["Console:DbConnection"]  ?? "Server=localhost;Database=doldb;User=dol;Password=dol;";
-var DOL_HOST        = builder.Configuration["Console:DolHost"]       ?? "127.0.0.1";
-var DOL_PORT        = int.Parse(builder.Configuration["Console:DolPort"] ?? "2000");
-var BRIDGE_SECRET   = builder.Configuration["Console:BridgeSecret"]  ?? "Aldhran_C0ns0le_Secret_2026";
-var DOL_SCRIPTS     = builder.Configuration["Console:ScriptsPath"]   ?? "/opt/dol/scripts/playerclasses/";
+try
+{
+    await database.EnsureSchemaAsync();
+}
+catch (Exception ex)
+{
+    logger.LogError(
+        ex,
+        "Database initialization failed. Bridge-only endpoints remain available; database-backed endpoints will fail until the connection is restored.");
+}
 
-// Befehle, die über /raw niemals ausgeführt werden dürfen (zusätzlich zur
-// zweiten Sperre in AldhranBridge.cs — defense in depth).
-var BLOCKED_RAW_COMMANDS = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+// Commands that must never be executed through /raw. AldhranBridge applies
+// the same independent blocklist as defense in depth.
+var blockedRawCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
     "shutdown", "quit"
 };
 
-// ── Auth middleware ────────────────────────────────────────────
-app.Use(async (ctx, next) =>
+static bool BridgeSucceeded(JsonElement response)
+    => response.ValueKind == JsonValueKind.Object
+        && response.TryGetProperty("ok", out JsonElement ok)
+        && ok.ValueKind == JsonValueKind.True;
+
+static async Task<bool> SetMoneyAsync(
+    BridgeClient bridgeClient,
+    string characterName,
+    long platinum,
+    long gold,
+    long silver,
+    long copper)
 {
-    if (!ctx.Request.Headers.TryGetValue("X-Aldhran-Secret", out var secret) || secret != API_SECRET)
+    (string Stat, long Value)[] values =
     {
-        ctx.Response.StatusCode = 401;
-        await ctx.Response.WriteAsJsonAsync(new { ok = false, error = "Unauthorized" });
-        return;
-    }
-    await next();
-});
+        ("platinum", platinum),
+        ("gold", gold),
+        ("silver", silver),
+        ("copper", copper)
+    };
 
-var logger = app.Services.GetRequiredService<ILogger<Program>>();
-
-// ── Bridge Helper ─────────────────────────────────────────────
-static async Task<string> SendBridgeCommand(string host, int port, string bridgeSecret, object payload, ILogger logger)
-{
-    try
+    foreach ((string stat, long value) in values)
     {
-        using var client = new TcpClient();
-        var cts = new System.Threading.CancellationTokenSource(3000);
-        await client.ConnectAsync(host, port, cts.Token);
-        using var stream = client.GetStream();
-        using var reader = new System.IO.StreamReader(stream, Encoding.UTF8);
-        using var writer = new System.IO.StreamWriter(stream, Encoding.UTF8) { AutoFlush = false };
+        if (value is < 0 or > int.MaxValue)
+            return false;
 
-        await writer.WriteLineAsync(bridgeSecret);
-        await writer.WriteLineAsync(JsonSerializer.Serialize(payload));
-        await writer.FlushAsync();
+        JsonElement response = await bridgeClient.SendAsync(new
+        {
+            action = "setstats",
+            name = characterName,
+            stat,
+            value = (int)value
+        });
 
-        var sb  = new StringBuilder();
-        var buf = new char[4096];
-        int read;
-        client.ReceiveTimeout = 5000;
-        while ((read = await reader.ReadAsync(buf, 0, buf.Length)) > 0)
-            sb.Append(buf, 0, read);
-
-        var response = sb.ToString().Trim();
-        var start = response.IndexOf('{');
-        var end   = response.LastIndexOf('}');
-        if (start >= 0 && end >= start)
-            response = response.Substring(start, end - start + 1);
-
-        return string.IsNullOrEmpty(response)
-            ? "{\"ok\":false,\"error\":\"No response\"}"
-            : response;
+        if (!BridgeSucceeded(response))
+            return false;
     }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Bridge command failed");
-        return JsonSerializer.Serialize(new { ok = false, error = ex.Message });
-    }
+
+    return true;
 }
 
-// ── DB Helpers ────────────────────────────────────────────────
-static async Task<List<Dictionary<string, object>>> QueryDb(string connStr, string sql, Dictionary<string, object>? parms = null)
-{
-    var rows = new List<Dictionary<string, object>>();
-    await using var conn = new MySqlConnection(connStr);
-    await conn.OpenAsync();
-    await using var cmd = new MySqlCommand(sql, conn);
-    if (parms != null)
-        foreach (var kv in parms)
-            cmd.Parameters.AddWithValue(kv.Key, kv.Value);
-    await using var rdr = await cmd.ExecuteReaderAsync();
-    while (await rdr.ReadAsync())
-    {
-        var row = new Dictionary<string, object>();
-        for (int i = 0; i < rdr.FieldCount; i++)
-            row[rdr.GetName(i)] = rdr.IsDBNull(i) ? "" : rdr.GetValue(i);
-        rows.Add(row);
-    }
-    return rows;
-}
+app.UseMiddleware<SecretAuthenticationMiddleware>();
 
-// Legt die Zone-Lookup-Tabelle bei Bedarf an (idempotent) und befüllt sie mit den
-// Haupt-City-Koordinaten. Diese Werte sind NICHT geraten, sondern 1:1 aus
-// GamePlayer.cs (Release()-Methode, eReleaseType.City) übernommen — dort stehen sie
-// als hartcodierte Realm-Release-Ziele im Server-Code:
-//   Albion:   Region 10,  x=8192+26315, y=8192+21177, z=8256  (City of Camelot)
-//   Midgard:  Region 101, x=8192+24664, y=8192+21402, z=8759  (Jordheim)
-//   Hibernia: Region 201, x=192+15780,  y=8192+22727, z=7060  (Tir Na Nog)
-// Die Tir-Na-Nog-X-Koordinate weicht bewusst vom 8192-Offset-Muster ab — das ist so
-// im Originalcode hinterlegt, kein Tippfehler dieser Migration.
-static async Task EnsureZonePointsTable(string connStr)
+app.MapGet("/health", () => Results.Ok(new
 {
-    await using var conn = new MySqlConnection(connStr);
-    await conn.OpenAsync();
-    await using var cmd = new MySqlCommand("""
-        CREATE TABLE IF NOT EXISTS `igc_zone_points` (
-            `zone_key`   VARCHAR(50) PRIMARY KEY,
-            `label`      VARCHAR(100) NOT NULL,
-            `region_id`  INT NOT NULL,
-            `x`          INT NOT NULL,
-            `y`          INT NOT NULL,
-            `z`          INT NOT NULL DEFAULT 0
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """, conn);
-    await cmd.ExecuteNonQueryAsync();
-
-    await using var seedCmd = new MySqlCommand("""
-        INSERT IGNORE INTO `igc_zone_points` (`zone_key`, `label`, `region_id`, `x`, `y`, `z`) VALUES
-            ('camelot_city',  'City of Camelot (Albion)',   10,  34507, 29369, 8256),
-            ('jordheim_city', 'Jordheim (Midgard)',         101, 32856, 29594, 8759),
-            ('tir_na_nog',    'Tir Na Nog (Hibernia)',      201, 15972, 30919, 7060);
-        """, conn);
-    await seedCmd.ExecuteNonQueryAsync();
-}
-await EnsureZonePointsTable(DB_CONN);
+    ok = true,
+    service = "AldhranConsole",
+    version = serviceVersion
+}));
 
 // ============================================================
-//  BESTEHENDE ENDPOINTS
+//  LIVE ADMIN ENDPOINTS
 // ============================================================
 
 // ── GET /status ───────────────────────────────────────────────
 app.MapGet("/status", async () =>
 {
-    try
-    {
-        var raw  = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET, new { action = "status" }, logger);
-        var data = JsonSerializer.Deserialize<JsonElement>(raw);
-        return Results.Ok(data);
-    }
-    catch (Exception ex) { return Results.Ok(new { ok = false, error = ex.Message }); }
+    return Results.Ok(await bridge.SendAsync(new { action = "status" }));
 });
 
 // ── POST /kick ────────────────────────────────────────────────
@@ -170,10 +113,9 @@ app.MapPost("/kick", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { ok = false, error = "name required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "kick", name, reason }, logger);
+    var result = await bridge.SendAsync(new { action = "kick", name, reason });
     logger.LogInformation("KICK: {name} — {reason}", name, reason);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(result);
 });
 
 // ── POST /privlevel ───────────────────────────────────────────
@@ -184,29 +126,12 @@ app.MapPost("/privlevel", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(name) || level < 0 || level > 3)
         return Results.BadRequest(new { ok = false, error = "name and level (0-3) required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "privlevel", name, level }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
-});
-
-// ── POST /gmmode ──────────────────────────────────────────────
-app.MapPost("/gmmode", async ([FromBody] JsonElement body) =>
-{
-    var name = body.TryGetProperty("name", out var n) ? n.GetString() : null;
-    var on   = body.TryGetProperty("on",   out var o) && o.GetBoolean();
-    if (string.IsNullOrWhiteSpace(name))
-        return Results.BadRequest(new { ok = false, error = "name required" });
-
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "gmmode", name, on }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "privlevel", name, level }));
 });
 
 // ── POST /teleport ────────────────────────────────────────────
-// FIX #3: "x" wurde fälschlich aus body["y"] gelesen (Copy-Paste-Bug) -> korrigiert.
-// FIX #4: "zone"-Feld wurde von PHP gesendet, aber nie ausgewertet. Jetzt: wenn ein
-// zone-Key übergeben wird, gegen igc_zone_points auflösen und dessen region/x/y/z
-// verwenden (überschreibt evtl. mitgesendete numerische Koordinaten).
+// A named zone is resolved through igc_zone_points and takes precedence over
+// numeric coordinates supplied in the same request.
 app.MapPost("/teleport", async ([FromBody] JsonElement body) =>
 {
     var name   = body.TryGetProperty("name",   out var n)  ? n.GetString() : null;
@@ -221,12 +146,12 @@ app.MapPost("/teleport", async ([FromBody] JsonElement body) =>
 
     if (!string.IsNullOrWhiteSpace(zone))
     {
-        var rows = await QueryDb(DB_CONN,
+        var rows = await database.QueryAsync(
             "SELECT region_id, x, y, z FROM igc_zone_points WHERE zone_key = @zone",
             new Dictionary<string, object> { ["@zone"] = zone });
 
         if (rows.Count == 0)
-            return Results.Ok(new { ok = false, error = $"Zone '{zone}' nicht gefunden." });
+            return Results.Ok(new { ok = false, error = $"Zone '{zone}' was not found." });
 
         region = Convert.ToInt32(rows[0]["region_id"]);
         x      = Convert.ToInt32(rows[0]["x"]);
@@ -234,9 +159,7 @@ app.MapPost("/teleport", async ([FromBody] JsonElement body) =>
         z      = Convert.ToInt32(rows[0]["z"]);
     }
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "teleport", name, x, y, z, region }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "teleport", name, x, y, z, region }));
 });
 
 // ── POST /giveitem ────────────────────────────────────────────
@@ -247,10 +170,10 @@ app.MapPost("/giveitem", async ([FromBody] JsonElement body) =>
     var count  = body.TryGetProperty("count",   out var c)  ? c.GetInt32()   : 1;
     if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(itemId))
         return Results.BadRequest(new { ok = false, error = "name and item_id required" });
+    if (count < 1 || count > 100)
+        return Results.BadRequest(new { ok = false, error = "count must be between 1 and 100" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "giveitem", name, item_id = itemId, count }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "giveitem", name, item_id = itemId, count }));
 });
 
 // ── POST /guildchat ───────────────────────────────────────────
@@ -263,11 +186,10 @@ app.MapPost("/guildchat", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(guildName) || string.IsNullOrWhiteSpace(msg))
         return Results.BadRequest(new { ok = false, error = "guild and message required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "guildchat", guild = guildName, sender, message = msg }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(
+        new { action = "guildchat", guild = guildName, sender, message = msg }));
 });
-// Neuer Endpoint für das Item-Autocomplete im "Give Item"-Panel.
+// Item autocomplete for the ACP "Give Item" panel.
 app.MapGet("/items/search", async (HttpRequest request) =>
 {
     var q = request.Query["q"].ToString();
@@ -276,7 +198,7 @@ app.MapGet("/items/search", async (HttpRequest request) =>
 
     try
     {
-        var rows = await QueryDb(DB_CONN,
+        var rows = await database.QueryAsync(
             "SELECT Id_nb AS item_id, Name AS name, Level AS level FROM itemtemplate WHERE Name LIKE @q ORDER BY Name ASC LIMIT 20",
             new Dictionary<string, object> { ["@q"] = "%" + q + "%" });
         return Results.Ok(new { ok = true, items = rows });
@@ -284,7 +206,7 @@ app.MapGet("/items/search", async (HttpRequest request) =>
     catch (Exception ex)
     {
         logger.LogError(ex, "[ITEMS] search failed for query {q}", q);
-        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 500);
+        return Results.Json(new { ok = false, error = "The item search failed." }, statusCode: 500);
     }
 });
 
@@ -297,9 +219,7 @@ app.MapPost("/setstats", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(stat))
         return Results.BadRequest(new { ok = false, error = "name and stat required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "setstats", name, stat, value = val }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "setstats", name, stat, value = val }));
 });
 
 // ── POST /broadcast ───────────────────────────────────────────
@@ -310,9 +230,7 @@ app.MapPost("/broadcast", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(msg))
         return Results.BadRequest(new { ok = false, error = "message required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "broadcast", message = msg, sender }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "broadcast", message = msg, sender }));
 });
 
 // ── POST /restart ─────────────────────────────────────────────
@@ -327,22 +245,20 @@ app.MapPost("/restart", async ([FromBody] JsonElement body) =>
     logger.LogWarning("[RESTART] Scheduled by {sender} in {delay}min — announcement: {ann}",
         sender, delayMinutes, string.IsNullOrWhiteSpace(announcement) ? "—" : announcement);
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET, new
+    var result = await bridge.SendAsync(new
     {
         action        = "restart",
         delay_minutes = delayMinutes,
         announcement  = announcement ?? "",
         sender
-    }, logger);
+    });
 
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(result);
 });
 
 // ── POST /raw ─────────────────────────────────────────────────
-// FIX #7: Sendete bisher fälschlich action="broadcast" -> jetzt korrekt action="raw",
-// die Bridge führt den Befehl über ScriptMgr.GuessCommand() wirklich aus.
-// Zusätzlich: einfache Blockliste für kritische Befehle, bevor überhaupt an die
-// Bridge weitergeleitet wird (defense in depth, zweite Sperre sitzt in der Bridge).
+// The bridge resolves the command through ScriptMgr.GuessCommand(). Critical
+// commands are rejected here before they reach the second blocklist in the bridge.
 app.MapPost("/raw", async ([FromBody] JsonElement body) =>
 {
     var cmd      = body.TryGetProperty("command",  out var c) ? c.GetString() : null;
@@ -352,16 +268,15 @@ app.MapPost("/raw", async ([FromBody] JsonElement body) =>
         return Results.BadRequest(new { ok = false, error = "command required" });
 
     var firstWord = cmd.Trim().TrimStart('/').Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-    if (BLOCKED_RAW_COMMANDS.Contains(firstWord))
+    if (blockedRawCommands.Contains(firstWord))
     {
         logger.LogWarning("RAW COMMAND blocked: {cmd}", cmd);
-        return Results.Ok(new { ok = false, error = $"Befehl '{firstWord}' ist gesperrt." });
+        return Results.Ok(new { ok = false, error = $"Command '{firstWord}' is blocked." });
     }
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "raw", command = cmd, executor }, logger);
+    var result = await bridge.SendAsync(new { action = "raw", command = cmd, executor });
     logger.LogWarning("RAW COMMAND: {cmd}", cmd);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(result);
 });
 
 // ── POST /heal ────────────────────────────────────────────────
@@ -371,9 +286,7 @@ app.MapPost("/heal", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { ok = false, error = "name required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "heal", name }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "heal", name }));
 });
 
 // ── POST /revive ──────────────────────────────────────────────
@@ -383,9 +296,7 @@ app.MapPost("/revive", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { ok = false, error = "name required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "revive", name }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "revive", name }));
 });
 
 // ── POST /freeze ──────────────────────────────────────────────
@@ -396,9 +307,7 @@ app.MapPost("/freeze", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { ok = false, error = "name required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "freeze", name, on }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "freeze", name, on }));
 });
 
 // ── POST /mute ────────────────────────────────────────────────
@@ -409,9 +318,7 @@ app.MapPost("/mute", async ([FromBody] JsonElement body) =>
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { ok = false, error = "name required" });
 
-    var raw = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET,
-        new { action = "mute", name, on }, logger);
-    return Results.Ok(JsonSerializer.Deserialize<JsonElement>(raw));
+    return Results.Ok(await bridge.SendAsync(new { action = "mute", name, on }));
 });
 
 // ============================================================
@@ -432,7 +339,7 @@ app.MapGet("/shop/cm-listings", async (HttpRequest request) =>
         FROM inventory i
         JOIN houseconsignmentmerchant hcm ON i.OwnerID = hcm.OwnerID
         JOIN dbhouse h ON hcm.HouseNumber = h.HouseNumber
-        WHERE i.ITemplate_Id = @itemId AND i.SellPrice > 0
+        WHERE i.ITemplate_Id = @itemId AND i.SellPrice > 0 AND i.Count > 0
         ORDER BY i.SellPrice ASC
         """;
 
@@ -441,20 +348,21 @@ app.MapGet("/shop/cm-listings", async (HttpRequest request) =>
     var regionParam = request.Query["realm_region"].ToString();
     if (!string.IsNullOrWhiteSpace(regionParam) && int.TryParse(regionParam, out var regionId))
     {
-        sql = sql.Replace("WHERE i.ITemplate_Id = @itemId AND i.SellPrice > 0",
-                           "WHERE i.ITemplate_Id = @itemId AND i.SellPrice > 0 AND h.RegionID = @regionId");
+        sql = sql.Replace(
+            "WHERE i.ITemplate_Id = @itemId AND i.SellPrice > 0 AND i.Count > 0",
+            "WHERE i.ITemplate_Id = @itemId AND i.SellPrice > 0 AND i.Count > 0 AND h.RegionID = @regionId");
         parms["@regionId"] = regionId;
     }
 
     try
     {
-        var rows = await QueryDb(DB_CONN, sql, parms);
+        var rows = await database.QueryAsync(sql, parms);
         return Results.Ok(new { ok = true, listings = rows });
     }
     catch (Exception ex)
     {
         logger.LogError(ex, "[SHOP] cm-listings query failed for item {item}", itemId);
-        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 500);
+        return Results.Json(new { ok = false, error = "The listings could not be loaded." }, statusCode: 500);
     }
 });
 
@@ -478,62 +386,73 @@ app.MapPost("/shop/purchase", async ([FromBody] JsonElement body) =>
     logger.LogInformation("[SHOP] Purchase attempt: {buyer} buying {ref} ({source}) x{count}",
         buyer, itemRef, source, count);
 
+    bool listingReserved = false;
+    bool itemDelivered = false;
+    bool balanceChanged = false;
+    long originalPlatinum = 0;
+    long originalGold = 0;
+    long originalSilver = 0;
+    long originalCopper = 0;
+
     try
     {
-        string itemId = "";
-        int finalPrice = 0;
+        string itemId;
+        long finalPrice;
 
-        // 1. Preisermittlung und Bestandsprüfung über die DB
+        // 1. Resolve price and availability from the game database.
         if (source == "system")
         {
-            itemId = itemRef.Replace("sys_", "");
-            var sysItems = await QueryDb(DB_CONN, "SELECT base_price FROM shop_system_items WHERE item_id = @itemId AND active = 1", new() { ["@itemId"] = itemId });
-            if (sysItems.Count == 0) return Results.Ok(new { ok = false, error = "Item nicht mehr im System-Katalog verfügbar." });
-            finalPrice = (int)Math.Round(Convert.ToInt32(sysItems[0]["base_price"]) * 1.30) * count;
+            itemId = itemRef.StartsWith("sys_", StringComparison.Ordinal) ? itemRef[4..] : itemRef;
+            var sysItems = await database.QueryAsync(
+                "SELECT base_price FROM shop_system_items WHERE item_id = @itemId AND active = 1",
+                new Dictionary<string, object> { ["@itemId"] = itemId });
+            if (sysItems.Count == 0) return Results.Ok(new { ok = false, error = "The item is no longer available in the system catalogue." });
+            finalPrice = Convert.ToInt64(
+                Math.Round(Convert.ToInt64(sysItems[0]["base_price"]) * 1.30)) * count;
         }
         else
         {
-            var listings = await QueryDb(DB_CONN, "SELECT ITemplate_Id, SellPrice, Count FROM inventory WHERE Inventory_ID = @ref AND SellPrice > 0", new() { ["@ref"] = itemRef });
-            if (listings.Count == 0) return Results.Ok(new { ok = false, error = "Dieses Angebot ist nicht mehr verfügbar." });
-            if (Convert.ToInt32(listings[0]["Count"]) < count) return Results.Ok(new { ok = false, error = "Nicht genügend Artikel beim Verkäufer vorrätig." });
-            itemId = listings[0]["ITemplate_Id"].ToString();
-            finalPrice = Convert.ToInt32(listings[0]["SellPrice"]) * count;
+            var listings = await database.QueryAsync(
+                "SELECT ITemplate_Id, SellPrice, Count FROM inventory WHERE Inventory_ID = @ref AND SellPrice > 0",
+                new Dictionary<string, object> { ["@ref"] = itemRef });
+            if (listings.Count == 0) return Results.Ok(new { ok = false, error = "The listing is no longer available." });
+            if (Convert.ToInt32(listings[0]["Count"]) < count) return Results.Ok(new { ok = false, error = "The seller does not have enough items in stock." });
+            itemId = listings[0]["ITemplate_Id"].ToString() ?? "";
+            finalPrice = Convert.ToInt64(listings[0]["SellPrice"]) * count;
         }
 
-        // 2. Goldprüfung des Käufers über die DB
-        var playerQuery = await QueryDb(DB_CONN, "SELECT Platinum, Gold, Silver, Copper FROM dolcharacters WHERE Name = @name", new() { ["@name"] = buyer });
-        if (playerQuery.Count == 0) return Results.Ok(new { ok = false, error = "Charakter nicht gefunden." });
+        // 2. Verify the buyer's balance in the game database.
+        var playerQuery = await database.QueryAsync(
+            "SELECT Platinum, Gold, Silver, Copper FROM dolcharacters WHERE Name = @name",
+            new Dictionary<string, object> { ["@name"] = buyer });
+        if (playerQuery.Count == 0) return Results.Ok(new { ok = false, error = "Character not found." });
 
         long plat = playerQuery[0]["Platinum"].ToString() == "" ? 0 : Convert.ToInt64(playerQuery[0]["Platinum"]);
         long gold = playerQuery[0]["Gold"].ToString() == "" ? 0 : Convert.ToInt64(playerQuery[0]["Gold"]);
         long silv = playerQuery[0]["Silver"].ToString() == "" ? 0 : Convert.ToInt64(playerQuery[0]["Silver"]);
         long copp = playerQuery[0]["Copper"].ToString() == "" ? 0 : Convert.ToInt64(playerQuery[0]["Copper"]);
+        originalPlatinum = plat;
+        originalGold = gold;
+        originalSilver = silv;
+        originalCopper = copp;
 
         long totalCopper = copp + (silv * 100L) + (gold * 10000L) + (plat * 10000000L);
 
-        if (totalCopper < finalPrice) return Results.Ok(new { ok = false, error = "Du hast nicht genügend Gold für diesen Kauf." });
+        if (totalCopper < finalPrice) return Results.Ok(new { ok = false, error = "The character does not have enough gold for this purchase." });
 
-        // 3. Wenn Spieler-Verkauf, Item aus dem Consignment Merchant entfernen
+        // 3. Reserve a player listing atomically before changing live character state.
         if (source == "player")
         {
-            await using (var conn = new MySqlConnection(DB_CONN))
-            {
-                await conn.OpenAsync();
-                await using (var cmdUpdate = new MySqlCommand("UPDATE inventory SET Count = Count - @count WHERE Inventory_ID = @ref", conn))
-                {
-                    cmdUpdate.Parameters.AddWithValue("@count", count);
-                    cmdUpdate.Parameters.AddWithValue("@ref", itemRef);
-                    await cmdUpdate.ExecuteNonQueryAsync();
-                }
-                await using (var cmdDelete = new MySqlCommand("DELETE FROM inventory WHERE Inventory_ID = @ref AND Count <= 0", conn))
-                {
-                    cmdDelete.Parameters.AddWithValue("@ref", itemRef);
-                    await cmdDelete.ExecuteNonQueryAsync();
-                }
-            }
+            int reserved = await database.ExecuteAsync(
+                "UPDATE inventory SET Count = Count - @count " +
+                "WHERE Inventory_ID = @ref AND SellPrice > 0 AND Count >= @count",
+                new Dictionary<string, object> { ["@count"] = count, ["@ref"] = itemRef });
+            if (reserved != 1)
+                return Results.Ok(new { ok = false, error = "The listing is no longer available in the requested quantity." });
+            listingReserved = true;
         }
 
-        // 4. Gold-Abzug live im Spiel über die funktionierende setstats-Aktion triggern
+        // 4. Apply the new balance to the live character through AldhranBridge.
         long remaining = totalCopper - finalPrice;
         long newPlat = remaining / 10000000L;
         remaining %= 10000000L;
@@ -542,27 +461,58 @@ app.MapPost("/shop/purchase", async ([FromBody] JsonElement body) =>
         long newSilv = remaining / 100L;
         long newCopp = remaining % 100L;
 
-        await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET, new { action = "setstats", name = buyer, stat = "platinum", value = (int)newPlat }, logger);
-        await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET, new { action = "setstats", name = buyer, stat = "gold", value = (int)newGold }, logger);
-        await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET, new { action = "setstats", name = buyer, stat = "silver", value = (int)newSilv }, logger);
-        await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET, new { action = "setstats", name = buyer, stat = "copper", value = (int)newCopp }, logger);
+        bool moneyUpdated = await SetMoneyAsync(bridge, buyer, newPlat, newGold, newSilv, newCopp);
+        if (!moneyUpdated)
+        {
+            await SetMoneyAsync(bridge, buyer, plat, gold, silv, copp);
+            if (listingReserved)
+            {
+                await database.ExecuteAsync(
+                    "UPDATE inventory SET Count = Count + @count WHERE Inventory_ID = @ref",
+                    new Dictionary<string, object> { ["@count"] = count, ["@ref"] = itemRef });
+            }
 
-        // 5. Item-Zustellung über die funktionierende Haupt-Brücke (DOL_PORT)
-        var rawResponse = await SendBridgeCommand(DOL_HOST, DOL_PORT, BRIDGE_SECRET, new
+            return Results.Ok(new { ok = false, error = "The character balance could not be updated." });
+        }
+        balanceChanged = true;
+
+        // 5. Deliver through the core-neutral AldhranBridge protocol.
+        JsonElement delivery = await bridge.SendAsync(new
         {
             action = "giveitem",
             name = buyer,
             item_id = itemId,
             count = count
-        }, logger);
+        });
 
-        var data = JsonSerializer.Deserialize<JsonElement>(rawResponse);
-        var bridgeOk = data.TryGetProperty("ok", out var okEl) && okEl.GetBoolean();
-
-        if (!bridgeOk)
+        if (!BridgeSucceeded(delivery))
         {
             logger.LogError("[SHOP] CRITICAL: gold deducted but delivery failed via giveitem — buyer={buyer} item={item}", buyer, itemId);
-            return Results.Ok(new { ok = false, gold_deducted = true, item_id = itemId, error = "In-game delivery failed. Queued for fallback." });
+            bool moneyRestored = await SetMoneyAsync(bridge, buyer, plat, gold, silv, copp);
+            if (listingReserved)
+            {
+                await database.ExecuteAsync(
+                    "UPDATE inventory SET Count = Count + @count WHERE Inventory_ID = @ref",
+                    new Dictionary<string, object> { ["@count"] = count, ["@ref"] = itemRef });
+            }
+
+            return Results.Ok(new
+            {
+                ok = false,
+                gold_deducted = !moneyRestored,
+                item_id = itemId,
+                error = moneyRestored
+                    ? "In-game delivery failed; the purchase was rolled back."
+                    : "In-game delivery failed and the automatic balance rollback also failed. Contact an administrator."
+            });
+        }
+        itemDelivered = true;
+
+        if (listingReserved)
+        {
+            await database.ExecuteAsync(
+                "DELETE FROM inventory WHERE Inventory_ID = @ref AND Count <= 0",
+                new Dictionary<string, object> { ["@ref"] = itemRef });
         }
 
         logger.LogInformation("[SHOP] Purchase OK: {buyer} bought {item} x{count}", buyer, itemId, count);
@@ -571,7 +521,37 @@ app.MapPost("/shop/purchase", async ([FromBody] JsonElement body) =>
     catch (Exception ex)
     {
         logger.LogError(ex, "[SHOP] Exception during purchase handler for {buyer}", buyer);
-        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 500);
+
+        try
+        {
+            if (balanceChanged && !itemDelivered)
+            {
+                await SetMoneyAsync(
+                    bridge,
+                    buyer!,
+                    originalPlatinum,
+                    originalGold,
+                    originalSilver,
+                    originalCopper);
+            }
+
+            if (listingReserved && !itemDelivered)
+            {
+                await database.ExecuteAsync(
+                    "UPDATE inventory SET Count = Count + @count WHERE Inventory_ID = @ref",
+                    new Dictionary<string, object> { ["@count"] = count, ["@ref"] = itemRef! });
+            }
+        }
+        catch (Exception rollbackException)
+        {
+            logger.LogError(
+                rollbackException,
+                "[SHOP] Automatic rollback failed for buyer={buyer} item={item}",
+                buyer,
+                itemRef);
+        }
+
+        return Results.Json(new { ok = false, error = "The purchase could not be completed." }, statusCode: 500);
     }
 });
 
@@ -598,9 +578,14 @@ app.MapPost("/world-forge/upload", async ([FromBody] JsonElement body) =>
 
     try
     {
-        Directory.CreateDirectory(DOL_SCRIPTS);
+        if (string.IsNullOrWhiteSpace(options.ScriptsPath))
+            return Results.Json(
+                new { ok = false, error = "Console:ScriptsPath is not configured." },
+                statusCode: 503);
 
-        var targetPath = Path.Combine(DOL_SCRIPTS, filename);
+        Directory.CreateDirectory(options.ScriptsPath);
+
+        var targetPath = Path.Combine(options.ScriptsPath, filename);
         await File.WriteAllTextAsync(targetPath, content, Encoding.UTF8);
 
         logger.LogInformation("[WORLD FORGE] Uploaded: {file} ({bytes} bytes)",
@@ -611,7 +596,7 @@ app.MapPost("/world-forge/upload", async ([FromBody] JsonElement body) =>
     catch (Exception ex)
     {
         logger.LogError(ex, "[WORLD FORGE] Upload failed: {file}", filename);
-        return Results.Json(new { ok = false, error = ex.Message },
+        return Results.Json(new { ok = false, error = "The file could not be uploaded." },
             statusCode: 500);
     }
 });
@@ -631,10 +616,7 @@ app.MapPost("/world-forge/sync-realm", async ([FromBody] JsonElement body) =>
 
     try
     {
-        await using var conn = new MySqlConnection(DB_CONN);
-        await conn.OpenAsync();
-
-        await using (var createCmd = new MySqlCommand("""
+        await database.ExecuteAsync("""
             CREATE TABLE IF NOT EXISTS `worldforge_realms` (
                 `id`          INT AUTO_INCREMENT PRIMARY KEY,
                 `name`        VARCHAR(100) NOT NULL,
@@ -647,10 +629,9 @@ app.MapPost("/world-forge/sync-realm", async ([FromBody] JsonElement body) =>
                     ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY `uq_realm_name` (`name`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """, conn))
-            await createCmd.ExecuteNonQueryAsync();
+            """);
 
-        await using var upsert = new MySqlCommand("""
+        await database.ExecuteAsync("""
             INSERT INTO `worldforge_realms`
                 (`name`, `short_name`, `tagline`, `lore_context`, `class_count`, `status`)
             VALUES
@@ -662,15 +643,16 @@ app.MapPost("/world-forge/sync-realm", async ([FromBody] JsonElement body) =>
                 `class_count`  = VALUES(`class_count`),
                 `status`       = VALUES(`status`),
                 `synced_at`    = CURRENT_TIMESTAMP;
-            """, conn);
-
-        upsert.Parameters.AddWithValue("@name",   name);
-        upsert.Parameters.AddWithValue("@sn",     shortName);
-        upsert.Parameters.AddWithValue("@tagline", tagline);
-        upsert.Parameters.AddWithValue("@lore",   loreContext);
-        upsert.Parameters.AddWithValue("@cc",     classCount);
-        upsert.Parameters.AddWithValue("@status", status);
-        await upsert.ExecuteNonQueryAsync();
+            """,
+            new Dictionary<string, object>
+            {
+                ["@name"] = name,
+                ["@sn"] = shortName,
+                ["@tagline"] = tagline,
+                ["@lore"] = loreContext,
+                ["@cc"] = classCount,
+                ["@status"] = status
+            });
 
         logger.LogInformation("[WORLD FORGE] Realm synced: {name} ({status}, {cc} classes)",
             name, status, classCount);
@@ -680,7 +662,7 @@ app.MapPost("/world-forge/sync-realm", async ([FromBody] JsonElement body) =>
     catch (Exception ex)
     {
         logger.LogError(ex, "[WORLD FORGE] Realm sync failed: {name}", name);
-        return Results.Json(new { ok = false, error = ex.Message },
+        return Results.Json(new { ok = false, error = "The realm data could not be synchronized." },
             statusCode: 500);
     }
 });
@@ -690,15 +672,16 @@ app.MapGet("/world-forge/realms", async () =>
 {
     try
     {
-        var rows = await QueryDb(DB_CONN,
+        var rows = await database.QueryAsync(
             "SELECT id, name, short_name, tagline, class_count, status, synced_at " +
             "FROM worldforge_realms ORDER BY synced_at DESC");
         return Results.Ok(new { ok = true, realms = rows });
     }
     catch (Exception ex)
     {
-        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 500);
+        logger.LogError(ex, "[WORLD FORGE] Realm list failed.");
+        return Results.Json(new { ok = false, error = "The realm data could not be loaded." }, statusCode: 500);
     }
 });
 
-app.Run("http://0.0.0.0:5100");
+app.Run(options.ListenUrl);

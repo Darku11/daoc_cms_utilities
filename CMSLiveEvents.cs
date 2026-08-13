@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
@@ -15,24 +16,22 @@ namespace DOL.GS.Scripts
         // Your site's api_events.php endpoint.
         private const string API_URL = "https://YOUR-SITE.example/api_events.php";
 
-        // Must match "Bridge Secret" under ACP -> General Settings -> Bridge Connection
-        // (game_server_bridge_secret).
+        // Must match "Shared Secret" under ACP -> General Settings -> Bridge Connection
+        // (game_server_shared_secret).
         private const string BRIDGE_SECRET = "CHANGE_ME_BRIDGE_SECRET";
 
         [ScriptLoadedEvent]
         public static void OnScriptCompiled(DOLEvent e, object sender, EventArgs args)
         {
             GameEventMgr.AddHandler(GameLivingEvent.Dying, OnPlayerDying);
-            // Keep-capture events vary by DOL version — wire this up once you've
-            // confirmed the event name for your fork, e.g. GameKeepEvent.Captured.
-            // GameEventMgr.AddHandler(GameKeepEvent.Captured, OnKeepCaptured);
+            GameEventMgr.AddHandler(KeepEvent.KeepTaken, OnKeepCaptured);
         }
 
         [ScriptUnloadedEvent]
         public static void OnScriptUnloaded(DOLEvent e, object sender, EventArgs args)
         {
             GameEventMgr.RemoveHandler(GameLivingEvent.Dying, OnPlayerDying);
-            // GameEventMgr.RemoveHandler(GameKeepEvent.Captured, OnKeepCaptured);
+            GameEventMgr.RemoveHandler(KeepEvent.KeepTaken, OnKeepCaptured);
         }
 
         private static void OnPlayerDying(DOLEvent e, object sender, EventArgs args)
@@ -51,10 +50,29 @@ namespace DOL.GS.Scripts
 
         private static void OnKeepCaptured(DOLEvent e, object sender, EventArgs args)
         {
-            var keep = sender as AbstractGameKeep;
+            // DOL and OpenDAoC both fire KeepEvent.KeepTaken globally with
+            // KeepEventArgs; the global event sender itself is null.
+            var keepArgs = args as KeepEventArgs;
+            var keep = keepArgs?.Keep ?? sender as AbstractGameKeep;
             if (keep == null) return;
 
-            string realm = keep.Realm == eRealm.Albion ? "Albion" : keep.Realm == eRealm.Midgard ? "Midgard" : "Hibernia";
+            string realm;
+            switch (keep.Realm)
+            {
+                case eRealm.Albion:
+                    realm = "Albion";
+                    break;
+                case eRealm.Midgard:
+                    realm = "Midgard";
+                    break;
+                case eRealm.Hibernia:
+                    realm = "Hibernia";
+                    break;
+                default:
+                    realm = "Neutral";
+                    break;
+            }
+
             string msg = $"{keep.Name} has been captured by {realm}!";
             SendEventAsync("keep", msg);
         }

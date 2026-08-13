@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -18,7 +19,7 @@ namespace DOL.GS.Scripts
     /// <summary>
     /// Aldhran Console Bridge.
     /// Listens on BRIDGE_PORT and serves every action the AldhranConsole (the
-    /// ASP.NET service, "program.cs") sends: status, kick, privlevel, gmmode,
+    /// ASP.NET service, "Program.cs") sends: status, kick, privlevel,
     /// teleport, giveitem, setstats, broadcast, restart, raw, heal, revive,
     /// freeze, mute, guildchat.
     ///
@@ -278,7 +279,7 @@ namespace DOL.GS.Scripts
         private static TcpListener _listener;
         private static bool _isRunning;
 
-        // Must match "Console:BridgeSecret" in the AldhranConsole's appsettings.json exactly.
+        // Must match "Console:SharedSecret" in AldhranConsole's appsettings.json exactly.
         private const string BRIDGE_SECRET = "CHANGE_ME_BRIDGE_SECRET";
         private const int BRIDGE_PORT = 2000;
 
@@ -358,11 +359,8 @@ namespace DOL.GS.Scripts
 
                         if (secret != BRIDGE_SECRET)
                         {
-                            string preview = secret.Length <= 6
-                                ? new string('*', secret.Length)
-                                : secret.Substring(0, 3) + "..." + secret.Substring(secret.Length - 3);
                             log.Warn($"[AldhranBridge] Invalid secret received. " +
-                                     $"Length={secret.Length} (expected={BRIDGE_SECRET.Length}), preview='{preview}'");
+                                     $"Length={secret.Length} (expected={BRIDGE_SECRET.Length}).");
                             return;
                         }
 
@@ -546,6 +544,9 @@ namespace DOL.GS.Scripts
         // ── giveitem ──────────────────────────────────────────────
         private static string Handle_GiveItem(string buyerName, string itemId, int count)
         {
+            if (count < 1 || count > 100)
+                return JsonConvert.SerializeObject(new { ok = false, error = "Count must be between 1 and 100." });
+
             GameClient client = ServerCoreCompat.FindClientByName(buyerName);
             GamePlayer player = client?.Player;
 

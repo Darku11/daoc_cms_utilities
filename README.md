@@ -12,11 +12,13 @@ The in-game console bridge. Runs as a script inside your DOL or OpenDAoC server'
 Runs unmodified on both **DOL** and **OpenDAoC** — the two forks' diverging APIs are resolved at load time through a small reflection-based compatibility shim (`ServerCoreCompat`) inside the file.
 
 ### AldhranConsole/
-The HTTP bridge between the DAoC CMS website and AldhranBridge.cs. A standalone ASP.NET Core (net10.0) minimal-API service — not a scripts-folder drop-in, it runs as its own process anywhere it can reach both the CMS and the game server. The CMS talks to it over HTTP (port 5100, `X-Aldhran-Secret` header); it forwards admin/console actions to AldhranBridge.cs over TCP and talks to the game database directly for the itemshop and item-autocomplete endpoints.
+The HTTP bridge between the DAoC CMS website and AldhranBridge.cs. A standalone ASP.NET Core (`net10.0`) minimal-API service — not a scripts-folder drop-in, it runs as its own process anywhere it can reach both the CMS and the game server. The CMS talks to it over HTTP (port 5100, `X-Aldhran-Secret` header); it forwards admin/console actions to AldhranBridge.cs over TCP and talks to the game database directly for the itemshop, item-autocomplete, zone and World Forge endpoints.
 
-It doesn't reference any DOL/OpenDAoC server assemblies — only the shared game database and the AldhranBridge TCP protocol, both of which are schema- and protocol-compatible across DOL and OpenDAoC — so it runs unmodified on **either** server implementation, no fork-specific code needed.
+It doesn't reference any DOL/OpenDAoC server assemblies. Core-specific live actions are handled by AldhranBridge's compatibility layer, while the Console uses database tables shared by the supported DOL and OpenDAoC schemas. The same Console build therefore runs with **either** server implementation.
 
-Copy `appsettings.json` and fill in `ApiSecret`, `DbConnection` and `BridgeSecret` before running it — the shipped file only contains placeholders. `BridgeSecret` must match the `BRIDGE_SECRET` constant in `AldhranBridge.cs`.
+Copy `appsettings.json` and fill in `SharedSecret` and `DbConnection` before running it — the shipped file only contains placeholders. `SharedSecret` must match `game_server_shared_secret` in the CMS and the `BRIDGE_SECRET` constant in `AldhranBridge.cs`.
+
+See [`AldhranConsole/README.md`](AldhranConsole/README.md) for configuration, build, publishing, endpoint and security instructions.
 
 ### CMSLiveEvents.cs
 Pushes PvP kill and keep-capture events from the game server to the CMS's live event feed (`api_events.php`). Drop-in script for the `scripts/` folder, runs unmodified on DOL and OpenDAoC.
