@@ -13,16 +13,16 @@ namespace DOL.GS.Scripts
     {
         private static readonly HttpClient _http = new HttpClient();
 
-        // Your site's api_events.php endpoint.
-        private const string API_URL = "https://YOUR-SITE.example/api_events.php";
-
-        // Must match "Shared Secret" under ACP -> General Settings -> Bridge Connection
-        // (game_server_shared_secret).
-        private const string BRIDGE_SECRET = "CHANGE_ME_BRIDGE_SECRET";
-
         [ScriptLoadedEvent]
         public static void OnScriptCompiled(DOLEvent e, object sender, EventArgs args)
         {
+            string configError;
+            if (!DAoCCmsBridgeConfig.TryLoad(out configError))
+            {
+                Console.Error.WriteLine("[CMSLiveEvents] " + configError);
+                return;
+            }
+
             GameEventMgr.AddHandler(GameLivingEvent.Dying, OnPlayerDying);
             GameEventMgr.AddHandler(KeepEvent.KeepTaken, OnKeepCaptured);
         }
@@ -79,18 +79,21 @@ namespace DOL.GS.Scripts
 
         private static void SendEventAsync(string type, string message)
         {
+            string apiUrl = DAoCCmsBridgeConfig.CmsApiUrl;
+            string sharedSecret = DAoCCmsBridgeConfig.SharedSecret;
+
             Task.Run(async () =>
             {
                 try
                 {
                     var content = new FormUrlEncodedContent(new[]
                     {
-                        new KeyValuePair<string, string>("secret", BRIDGE_SECRET),
+                        new KeyValuePair<string, string>("secret", sharedSecret),
                         new KeyValuePair<string, string>("type", type),
                         new KeyValuePair<string, string>("message", message)
                     });
 
-                    await _http.PostAsync(API_URL, content);
+                    await _http.PostAsync(apiUrl, content);
                 }
                 catch
                 {

@@ -405,7 +405,7 @@ namespace DOL.GS.Scripts
 
     /// <summary>
     /// Aldhran Console Bridge.
-    /// Listens on BRIDGE_PORT and serves every action the AldhranConsole (the
+    /// Listens on the configured bridge port and serves every action the AldhranConsole (the
     /// ASP.NET service, "Program.cs") sends: status, kick, privlevel,
     /// teleport, giveitem, setstats, broadcast, restart, raw, heal, revive,
     /// freeze, mute, guildchat.
@@ -535,6 +535,39 @@ namespace DOL.GS.Scripts
                 return ToClientList(Invoke(getAllClients, null, null));
 
             throw new MissingMethodException("No compatible online-client API was found for this game-server core.");
+        }
+
+        // OpenDAoC routes cross-thread client work through ClientService. DOL
+        // has no such service and executes the action immediately.
+        public static bool DispatchClientAction(Action action)
+        {
+            if (action == null)
+                throw new ArgumentNullException(nameof(action));
+
+            Type clientService = FindType("DOL.GS.ClientService");
+            if (clientService != null)
+            {
+                object instance = GetStaticMember(clientService, "Instance");
+                MethodInfo post = clientService
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "Post"
+                        && m.IsGenericMethodDefinition
+                        && m.GetGenericArguments().Length == 1
+                        && m.GetParameters().Length == 2);
+
+                if (instance != null && post != null)
+                {
+                    Action<Action> invoke = callback => callback();
+                    Invoke(
+                        post.MakeGenericMethod(typeof(Action)),
+                        instance,
+                        new object[] { invoke, action });
+                    return true;
+                }
+            }
+
+            action();
+            return false;
         }
 
         public static GameClient FindClientByName(string name)
@@ -806,11 +839,6 @@ namespace DOL.GS.Scripts
         private static TcpListener _listener;
         private static bool _isRunning;
 
-        // Must match "Console:SharedSecret" (or the legacy
-        // "Console:BridgeSecret") in AldhranConsole's appsettings.json exactly.
-        private const string BRIDGE_SECRET = "CHANGE_ME_BRIDGE_SECRET";
-        private const int BRIDGE_PORT = 2000;
-
         // Commands that must never run via /raw, even for a SuperAdmin
         // (in addition to any blocklist on the AldhranConsole side — defense in depth).
         private static readonly HashSet<string> BLOCKED_RAW_COMMANDS = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -829,11 +857,30 @@ namespace DOL.GS.Scripts
         public static void OnScriptCompiled(DOLEvent e, object sender, EventArgs args)
         {
             if (_isRunning) return;
-            _isRunning = true;
-            _listener = new TcpListener(IPAddress.Any, BRIDGE_PORT);
-            _listener.Start();
-            log.Info($"[AldhranBridge] Started on port {BRIDGE_PORT}.");
-            Task.Run(() => ListenLoop());
+
+            string configError;
+            if (!DAoCCmsBridgeConfig.TryLoad(out configError))
+            {
+                log.Error("[AldhranBridge] " + configError);
+                return;
+            }
+
+            int bridgePort = DAoCCmsBridgeConfig.BridgePort;
+            try
+            {
+                _listener = new TcpListener(IPAddress.Any, bridgePort);
+                _listener.Start();
+                _isRunning = true;
+                log.Info($"[AldhranBridge] Started on port {bridgePort}. " +
+                         $"Configuration={DAoCCmsBridgeConfig.ConfigPath}; " +
+                         $"secret length={DAoCCmsBridgeConfig.SharedSecret.Length}.");
+                Task.Run(() => ListenLoop());
+            }
+            catch (Exception ex)
+            {
+                _listener = null;
+                log.Error("[AldhranBridge] Could not start: " + ex.Message);
+            }
         }
 
         [ScriptUnloadedEvent]
@@ -885,10 +932,11 @@ namespace DOL.GS.Scripts
                         if (string.IsNullOrEmpty(secret) || string.IsNullOrEmpty(json))
                             return;
 
-                        if (secret != BRIDGE_SECRET)
+                        string expectedSecret = DAoCCmsBridgeConfig.SharedSecret;
+                        if (secret != expectedSecret)
                         {
                             log.Warn($"[AldhranBridge] Invalid secret received. " +
-                                     $"Length={secret.Length} (expected={BRIDGE_SECRET.Length}).");
+                                     $"Length={secret.Length} (expected={expectedSecret.Length}).");
                             return;
                         }
 
@@ -1327,21 +1375,61 @@ namespace DOL.GS.Scripts
 
             try
             {
-                int count = 0;
+                string requestedGuild = guildName.Trim();
                 string formattedMessage = $"[Discord] {sender}: {message}";
+                List<GameClient> onlineClients = ServerCoreCompat.AllClients();
+                List<GameClient> recipients = onlineClients
+                    .Where(gameClient => gameClient.Player != null
+                        && gameClient.Player.Guild != null
+                        && string.Equals(
+                            (gameClient.Player.Guild.Name ?? string.Empty).Trim(),
+                            requestedGuild,
+                            StringComparison.OrdinalIgnoreCase))
+                    .ToList();
 
-                foreach (GameClient gameClient in ServerCoreCompat.AllClients())
+                if (recipients.Count == 0)
                 {
-                    if (gameClient.Player != null && gameClient.Player.Guild != null)
+                    string[] onlineGuilds = onlineClients
+                        .Where(gameClient => gameClient.Player?.Guild != null)
+                        .Select(gameClient => (gameClient.Player.Guild.Name ?? string.Empty).Trim())
+                        .Where(name => name.Length > 0)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(name => name)
+                        .ToArray();
+
+                    int onlinePlayers = onlineClients.Count(gameClient => gameClient.Player != null);
+                    log.Warn($"[AldhranBridge] No online member found for guild '{requestedGuild}'. " +
+                             $"Online players={onlinePlayers}; online guilds=[{string.Join(", ", onlineGuilds)}].");
+
+                    return BridgeJson.SerializeObject(new
                     {
-                        if (gameClient.Player.Guild.Name.Equals(guildName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            gameClient.Out.SendMessage(formattedMessage, eChatType.CT_Guild, eChatLoc.CL_ChatWindow);
-                            count++;
-                        }
-                    }
+                        ok = false,
+                        recipients = 0,
+                        error = "No online member of the requested guild was found.",
+                        requested_guild = requestedGuild,
+                        online_players = onlinePlayers,
+                        online_guilds = onlineGuilds
+                    });
                 }
-                return BridgeJson.SerializeObject(new { ok = true, recipients = count });
+
+                Guild targetGuild = recipients[0].Player.Guild;
+                bool queued = ServerCoreCompat.DispatchClientAction(() =>
+                {
+                    targetGuild.SendMessageToGuildMembers(
+                        formattedMessage,
+                        eChatType.CT_Guild,
+                        eChatLoc.CL_ChatWindow);
+                });
+
+                log.Info($"[AldhranBridge] Delivered Discord guild chat to '{targetGuild.Name}' " +
+                         $"({recipients.Count} online recipient(s), {(queued ? "queued" : "sent")}).");
+
+                return BridgeJson.SerializeObject(new
+                {
+                    ok = true,
+                    recipients = recipients.Count,
+                    delivery = queued ? "queued" : "sent"
+                });
             }
             catch (Exception ex)
             {

@@ -6,15 +6,15 @@
  * NOT in the DOL/OpenDAoC core project (GameServer\commands\playercommands\guildchat.cs).
  *
  * Reason: SendMessageToGuildMembers() in the core (Guild.cs) doesn't log
- * anything and fires no post-send DOLEvent. Registering a second CmdAttribute
- * is not sufficient either: both DOLSharp and OpenDAoC suppress duplicate
- * commands. After all commands have loaded, this script therefore replaces
- * the two guild-chat dictionary entries and restores them when scripts unload.
- * guildchat.cs in the server core stays untouched.
+ * anything and fires no post-send DOLEvent. OpenDAoC loads script commands
+ * before the built-in core commands, so this script claims /gu directly. The
+ * installer below remains as a compatibility fallback for DOL builds that use
+ * a different assembly order. guildchat.cs in the server core stays untouched.
  *
  * TO VERIFY AFTER DEPLOYING: test /gu in-game and confirm the message still
  * arrives in guild chat as usual AND that api_events.php logs a "guild_chat"
- * event. There should be no duplicate-command warning for this script.
+ * event. OpenDAoC may report that its built-in &gu command was suppressed;
+ * that is expected because the script command was registered first.
  */
 using DOL.Events;
 using DOL.GS.PacketHandler;
@@ -26,24 +26,85 @@ using System;
 
 namespace DOL.GS.Commands
 {
+    internal static class GuildChatBridgeLog
+    {
+        public static void Info(string message) { Write("Info", message, false); }
+        public static void Warn(string message) { Write("Warn", message, true); }
+        public static void Error(string message) { Write("Error", message, true); }
+
+        private static void Write(string level, string message, bool error)
+        {
+            string formatted = "[GuildChatBridge] " + message;
+
+            try
+            {
+                PropertyInfo instanceProperty = typeof(GameServer).GetProperty(
+                    "Instance",
+                    BindingFlags.Public | BindingFlags.Static);
+                object server = instanceProperty?.GetValue(null);
+                PropertyInfo logProperty = server?.GetType().GetProperty(
+                    "Log",
+                    BindingFlags.Public | BindingFlags.Instance);
+                object logger = logProperty?.GetValue(server);
+
+                if (logger != null)
+                {
+                    foreach (MethodInfo method in logger.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                    {
+                        ParameterInfo[] parameters = method.GetParameters();
+                        if (method.Name == level
+                            && parameters.Length == 1
+                            && parameters[0].ParameterType.IsAssignableFrom(typeof(string)))
+                        {
+                            method.Invoke(logger, new object[] { formatted });
+                            return;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Fall through to the server console.
+            }
+
+            if (error)
+                Console.Error.WriteLine(formatted);
+            else
+                Console.WriteLine(formatted);
+        }
+    }
+
     public static class GuildChatBridgeInstaller
     {
         private static readonly object _sync = new object();
-        private static Dictionary<string, ScriptMgr.GameCommand> _commands;
-        private static ScriptMgr.GameCommand _originalGuildCommand;
-        private static ScriptMgr.GameCommand _originalGuildAlias;
-        private static bool _hadGuildAlias;
+        private static ScriptMgr.GameCommand _guildCommand;
+        private static ScriptMgr.GameCommand _guildAliasCommand;
+        private static ICommandHandler _originalGuildHandler;
+        private static ICommandHandler _originalGuildAliasHandler;
+        private static GuildChatBridgeCommandHandler _bridgeHandler;
         private static bool _installed;
 
-        private static Dictionary<string, ScriptMgr.GameCommand> GetCommandDictionary()
+        private static ScriptMgr.GameCommand FindCommand(string name)
         {
-            FieldInfo field = typeof(ScriptMgr).GetField(
-                "m_gameCommands",
-                BindingFlags.NonPublic | BindingFlags.Static);
+            MethodInfo getCommand = typeof(ScriptMgr).GetMethod(
+                "GetCommand",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                null,
+                new[] { typeof(string) },
+                null);
 
-            return field == null
-                ? null
-                : field.GetValue(null) as Dictionary<string, ScriptMgr.GameCommand>;
+            if (getCommand != null)
+                return getCommand.Invoke(null, new object[] { name }) as ScriptMgr.GameCommand;
+
+            // Compatibility fallback for older DOL builds without GetCommand.
+            FieldInfo registryField = typeof(ScriptMgr).GetField(
+                "m_gameCommands", BindingFlags.NonPublic | BindingFlags.Static);
+            var registry = registryField?.GetValue(null)
+                as Dictionary<string, ScriptMgr.GameCommand>;
+
+            return registry != null && registry.TryGetValue(name, out ScriptMgr.GameCommand command)
+                ? command
+                : null;
         }
 
         [ScriptLoadedEvent]
@@ -54,31 +115,54 @@ namespace DOL.GS.Commands
                 if (_installed)
                     return;
 
-                _commands = GetCommandDictionary();
-                if (_commands == null)
+                string configError;
+                if (!DAoCCmsBridgeConfig.TryLoad(out configError))
+                {
+                    GuildChatBridgeLog.Error(configError);
                     return;
+                }
 
                 // Respect DISABLED_COMMANDS and custom cores: do not silently
                 // enable guild chat when the server did not register /gu.
-                if (!_commands.TryGetValue("&gu", out _originalGuildCommand)
-                    || _originalGuildCommand == null)
+                _guildCommand = FindCommand("&gu");
+                if (_guildCommand == null || _guildCommand.m_cmdHandler == null)
                 {
-                    _commands = null;
+                    GuildChatBridgeLog.Warn("The &gu command is unavailable; the bridge was not installed.");
+                    _guildCommand = null;
                     return;
                 }
-                _hadGuildAlias = _commands.TryGetValue("&guild", out _originalGuildAlias);
 
-                ScriptMgr.GameCommand bridgeCommand = new ScriptMgr.GameCommand();
-                bridgeCommand.Usage = _originalGuildCommand.Usage;
-                bridgeCommand.m_cmd = _originalGuildCommand.m_cmd;
-                bridgeCommand.m_lvl = _originalGuildCommand.m_lvl;
-                bridgeCommand.m_desc = _originalGuildCommand.m_desc;
-                bridgeCommand.m_cmdHandler = new GuildChatBridgeCommandHandler();
+                _bridgeHandler = new GuildChatBridgeCommandHandler();
+                _originalGuildHandler = _guildCommand.m_cmdHandler;
 
-                _commands["&gu"] = bridgeCommand;
-                if (_hadGuildAlias)
-                    _commands["&guild"] = bridgeCommand;
+                // OpenDAoC loads commands from the script assembly first. In
+                // that case the CmdAttribute below already installed this
+                // handler and there is nothing left to replace.
+                if (_originalGuildHandler is GuildChatBridgeCommandHandler installedHandler)
+                {
+                    _bridgeHandler = installedHandler;
+                    _originalGuildHandler = null;
+                    _installed = true;
+                    GuildChatBridgeLog.Info(
+                        "Guild chat forwarding is active. Configuration=" +
+                        DAoCCmsBridgeConfig.ConfigPath + ".");
+                    return;
+                }
+
+                _guildCommand.m_cmdHandler = _bridgeHandler;
+
+                ScriptMgr.GameCommand alias = FindCommand("&guild");
+                if (alias != null && !ReferenceEquals(alias, _guildCommand))
+                {
+                    _guildAliasCommand = alias;
+                    _originalGuildAliasHandler = alias.m_cmdHandler;
+                    alias.m_cmdHandler = _bridgeHandler;
+                }
+
                 _installed = true;
+                GuildChatBridgeLog.Info(
+                    "Guild chat forwarding is active. Configuration=" +
+                    DAoCCmsBridgeConfig.ConfigPath + ".");
             }
         }
 
@@ -87,40 +171,46 @@ namespace DOL.GS.Commands
         {
             lock (_sync)
             {
-                if (!_installed || _commands == null)
+                if (!_installed)
                     return;
 
-                RestoreCommand("&gu", _originalGuildCommand);
-                if (_hadGuildAlias)
-                    RestoreCommand("&guild", _originalGuildAlias);
+                RestoreHandler(_guildCommand, _originalGuildHandler);
+                RestoreHandler(_guildAliasCommand, _originalGuildAliasHandler);
 
-                _commands = null;
-                _originalGuildCommand = null;
-                _originalGuildAlias = null;
-                _hadGuildAlias = false;
+                _guildCommand = null;
+                _guildAliasCommand = null;
+                _originalGuildHandler = null;
+                _originalGuildAliasHandler = null;
+                _bridgeHandler = null;
                 _installed = false;
             }
         }
 
-        private static void RestoreCommand(string name, ScriptMgr.GameCommand command)
+        private static void RestoreHandler(ScriptMgr.GameCommand command, ICommandHandler originalHandler)
         {
-            if (command == null)
-                _commands.Remove(name);
-            else
-                _commands[name] = command;
+            if (command != null
+                && originalHandler != null
+                && ReferenceEquals(command.m_cmdHandler, _bridgeHandler))
+                command.m_cmdHandler = originalHandler;
         }
     }
 
+    [CmdAttribute(
+        "&gu",
+        new string[] { "&guild" },
+        ePrivLevel.Player,
+        "Guild Chat command",
+        "/gu <text>")]
     public class GuildChatBridgeCommandHandler : AbstractCommandHandler, ICommandHandler
     {
-        private static readonly HttpClient _http = new HttpClient();
+        private static readonly HttpClient _http = CreateHttpClient();
 
-        // Your site's api_events.php endpoint.
-        private const string API_URL = "https://YOUR-SITE.example/api_events.php";
-
-        // Must match "Shared Secret" under ACP -> General Settings -> Bridge Connection
-        // (game_server_shared_secret).
-        private const string BRIDGE_SECRET = "CHANGE_ME_BRIDGE_SECRET";
+        private static HttpClient CreateHttpClient()
+        {
+            var client = new HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(10);
+            return client;
+        }
 
         // DOL accepts a params object[] while current OpenDAoC exposes a
         // dedicated two-string overload. Resolve either signature and fall
@@ -167,32 +257,61 @@ namespace DOL.GS.Commands
 
         private static void SendGuildChatToCms(string guildName, string playerName, string message)
         {
+            string apiUrl = DAoCCmsBridgeConfig.CmsApiUrl;
+            string sharedSecret = DAoCCmsBridgeConfig.SharedSecret;
+
             Task.Run(async () =>
             {
                 try
                 {
-                    var content = new FormUrlEncodedContent(new[]
+                    using (var content = new FormUrlEncodedContent(new[]
                     {
-                        new KeyValuePair<string, string>("secret", BRIDGE_SECRET),
+                        new KeyValuePair<string, string>("secret", sharedSecret),
                         new KeyValuePair<string, string>("type", "guild_chat"),
                         new KeyValuePair<string, string>("guild", guildName),
                         new KeyValuePair<string, string>("player", playerName),
                         new KeyValuePair<string, string>("message", message)
-                    });
+                    }))
+                    using (HttpResponseMessage response = await _http.PostAsync(apiUrl, content).ConfigureAwait(false))
+                    {
+                        string responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            GuildChatBridgeLog.Error(
+                                "CMS returned HTTP " + (int)response.StatusCode + ": " + Shorten(responseBody));
+                            return;
+                        }
 
-                    await _http.PostAsync(API_URL, content);
+                        if (responseBody.IndexOf("\"ok\":true", StringComparison.OrdinalIgnoreCase) < 0)
+                        {
+                            GuildChatBridgeLog.Error("CMS rejected the guild-chat event: " + Shorten(responseBody));
+                            return;
+                        }
+
+                        GuildChatBridgeLog.Info(
+                            "Forwarded guild chat from '" + playerName + "' in guild '" + guildName + "'.");
+                    }
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Intentionally empty so a failing web request never crashes the game server.
+                    GuildChatBridgeLog.Error("CMS request failed: " + ex.Message);
                 }
             });
+        }
+
+        private static string Shorten(string value)
+        {
+            string text = string.IsNullOrWhiteSpace(value) ? "empty response" : value.Trim();
+            return text.Length <= 500 ? text : text.Substring(0, 500) + "...";
         }
 
         public void OnCommand(GameClient client, string[] args)
         {
             // ── 1:1 identical to the original core logic from guildchat.cs,
             // so nothing changes about the player experience.
+            if (client?.Player == null)
+                return;
+
             if (client.Player.Guild == null)
             {
                 DisplayMessage(client, Text(client, "Scripts.Players.Guildchat.NoGuild", "You don't belong to a player guild."));
@@ -211,11 +330,15 @@ namespace DOL.GS.Commands
                 return;
             }
 
-            string rawText = string.Join(" ", args, 1, args.Length - 1);
+            string rawText = args != null && args.Length > 1
+                ? string.Join(" ", args, 1, args.Length - 1)
+                : string.Empty;
             string message = "[Guild] " + client.Player.Name + ": \"" + rawText + "\"";
             client.Player.Guild.SendMessageToGuildMembers(message, eChatType.CT_Guild, eChatLoc.CL_ChatWindow);
 
             // ── Forward to the CMS/Discord bridge.
+            GuildChatBridgeLog.Info(
+                "Captured guild chat from '" + client.Player.Name + "' in guild '" + client.Player.Guild.Name + "'.");
             SendGuildChatToCms(client.Player.Guild.Name, client.Player.Name, rawText);
         }
     }

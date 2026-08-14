@@ -39,8 +39,10 @@ Use the exact same secret in:
 
 - DAoC CMS: `game_server_shared_secret`
 - AldhranConsole: `Console:SharedSecret`
-- `AldhranBridge.cs`: `BRIDGE_SECRET`
-- `CMSLiveEvents.cs` and `GuildChatBridge.cs`: `BRIDGE_SECRET`, when those scripts are used
+- Game server: `SharedSecret` in `config/daoc_cms_bridge.conf`
+
+The CMS setup and ACP generate `daoc_cms_bridge.conf` for AldhranBridge, CMSLiveEvents and
+GuildChatBridge. Their C# source files contain no site-specific secret, URL or port.
 
 Existing installations can still use the former `Console:ApiSecret`, `Console:BridgeSecret`, `Console:DolHost` and `Console:DolPort` keys. New installations should use the keys shown above.
 
